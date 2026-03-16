@@ -41,10 +41,12 @@ class ExptConfig(BaseExptConfig):
                 "enabled": True,
                 "force_encoder": {
                     "enabled": True,
+                    "use_force_embedding_as_dit_condition": True,
                     "force_dim": 12,
                     "selected_dims": [6],
                     "history_frames": 10,
                     "encoder_type": "mlp",
+                    "force_embedding_dim": 1536,
                     "gru_hidden_dim": 128,
                     "gru_num_layers": 1,
                     "gru_bidirectional": False,
@@ -55,5 +57,5 @@ class ExptConfig(BaseExptConfig):
                     "num_layers": 2,
                     "dropout": 0.0,
                 },
-            }
+            },
         }

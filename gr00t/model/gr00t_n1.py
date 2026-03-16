@@ -24,6 +24,8 @@ from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
 from transformers.feature_extraction_utils import BatchFeature
 
+from gr00t.experiment.expt_config import ExptConfig
+
 from .action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
@@ -249,12 +251,21 @@ class GR00T_N1_5(PreTrainedModel):
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
         skip_backbone_on_force_condition = kwargs.pop("skip_backbone_on_force_condition", True)
+        force_cfg = ExptConfig().force_config()
+        force_encoder_cfg = force_cfg.get("force_input", {}).get("force_encoder", {})
+        use_force_embedding_as_dit_condition = bool(
+            force_encoder_cfg.get("use_force_embedding_as_dit_condition", False)
+        )
+        force_embedding_dim = int(force_encoder_cfg.get("force_embedding_dim", 1536))
+        backbone_embedding_dim = 1536
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
+        print(f"use_force_embedding_as_dit_condition: {use_force_embedding_as_dit_condition}")
+        print(f"force_embedding_dim: {force_embedding_dim}")
         print(
             "Skip backbone forward when force-conditioned DiT: "
             f"{skip_backbone_on_force_condition}"
@@ -272,6 +283,18 @@ class GR00T_N1_5(PreTrainedModel):
             )
             local_model_path = pretrained_model_name_or_path
 
+        if use_force_embedding_as_dit_condition:
+            try:
+                local_cfg = GR00T_N1_5_Config.from_pretrained(local_model_path)
+                backbone_embedding_dim = int(
+                    local_cfg.action_head_cfg.get("backbone_embedding_dim", backbone_embedding_dim)
+                )
+            except Exception:
+                pass
+            if force_embedding_dim != backbone_embedding_dim:
+                kwargs.setdefault("ignore_mismatched_sizes", True)
+            print(f"backbone_embedding_dim: {backbone_embedding_dim}")
+
         pretrained_model = super().from_pretrained(
             local_model_path, local_model_path=local_model_path, **kwargs
         )
@@ -282,6 +305,8 @@ class GR00T_N1_5(PreTrainedModel):
         pretrained_model.skip_backbone_on_force_condition = bool(
             skip_backbone_on_force_condition
         )
+        if getattr(pretrained_model.action_head, "random_reinit_dit_state_action", False):
+            pretrained_model.action_head.reinitialize_dit_state_action_encoders()
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model
         )

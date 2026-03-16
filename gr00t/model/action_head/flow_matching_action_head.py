@@ -171,15 +171,57 @@ class FlowmatchingActionHead(nn.Module):
         config: FlowmatchingActionHeadConfig,
     ):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.input_embedding_dim = config.input_embedding_dim
+        self.force_config = ExptConfig().force_config()
+        force_input_cfg = self.force_config.get("force_input", {})
+        force_encoder_cfg = force_input_cfg.get("force_encoder", {})
+        self.use_force_encoder = bool(force_input_cfg.get("enabled", False))
+        self.use_force_embedding_as_dit_condition = bool(
+            force_encoder_cfg.get("use_force_embedding_as_dit_condition", False)
+        )
+        self.random_reinit_dit_state_action = False
 
-        self.model = DiT(**config.diffusion_model_cfg)
+        self.hidden_size = int(config.hidden_size)
+        self.input_embedding_dim = int(config.input_embedding_dim)
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
-        self.force_config = ExptConfig().force_config()
         self.condition_source = "vl"
+
+        if self.use_force_encoder:
+            configured_force_embedding_dim = force_encoder_cfg.get(
+                "force_embedding_dim", self.input_embedding_dim
+            )
+            self.force_embedding_dim = int(configured_force_embedding_dim)
+            if self.force_embedding_dim <= 0:
+                raise ValueError(
+                    "force_encoder.force_embedding_dim should be a positive integer when provided"
+                )
+            if self.use_force_embedding_as_dit_condition:
+                self.input_embedding_dim = self.force_embedding_dim
+                config.input_embedding_dim = self.input_embedding_dim
+                self.condition_source = "force"
+
+                force_encoder_type = str(force_encoder_cfg.get("encoder_type", "mlp")).lower()
+                if force_encoder_type != "mlp":
+                    raise ValueError(
+                        "use_force_embedding_as_dit_condition requires force_encoder.encoder_type='mlp'"
+                    )
+
+                backbone_dim = int(config.backbone_embedding_dim)
+                if self.force_embedding_dim != backbone_dim:
+                    num_heads = int(config.diffusion_model_cfg["num_attention_heads"])
+                    if self.force_embedding_dim % num_heads != 0:
+                        raise ValueError(
+                            "force_embedding_dim must be divisible by diffusion_model_cfg.num_attention_heads "
+                            f"({num_heads}), got {self.force_embedding_dim}"
+                        )
+                    config.diffusion_model_cfg["attention_head_dim"] = self.force_embedding_dim // num_heads
+                    config.diffusion_model_cfg["cross_attention_dim"] = self.force_embedding_dim
+                    self.random_reinit_dit_state_action = True
+        else:
+            self.force_embedding_dim = self.input_embedding_dim
+
+        self.model = DiT(**config.diffusion_model_cfg)
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -187,16 +229,24 @@ class FlowmatchingActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.input_embedding_dim,
         )
-        if self.force_config.get("force_input", {}).get("enabled", False):
-            self.use_force_encoder = True
-            force_encoder_cfg = self.force_config.get("force_input", {}).get("force_encoder", {})
-            self.condition_source = str(force_encoder_cfg.get("condition_source", "force")).lower()
-            if self.condition_source not in ("vl", "force"):
-                raise ValueError(
-                    f"Unsupported force_encoder.condition_source={self.condition_source!r}, "
-                    "expected 'vl' or 'force'"
-                )
+        if self.use_force_encoder:
+            if not self.use_force_embedding_as_dit_condition:
+                self.condition_source = str(force_encoder_cfg.get("condition_source", "force")).lower()
+                if self.condition_source not in ("vl", "force"):
+                    raise ValueError(
+                        f"Unsupported force_encoder.condition_source={self.condition_source!r}, "
+                        "expected 'vl' or 'force'"
+                    )
             force_encoder_type = str(force_encoder_cfg.get("encoder_type", "mlp")).lower()
+            if self.use_force_embedding_as_dit_condition and force_encoder_type != "mlp":
+                raise ValueError(
+                    "use_force_embedding_as_dit_condition requires force_encoder.encoder_type='mlp'"
+                )
+            force_encoder_dropout = (
+                0.0
+                if self.use_force_embedding_as_dit_condition
+                else force_encoder_cfg.get("dropout", 0.1)
+            )
             selected_force_dims = force_encoder_cfg.get("selected_dims", None)
             if selected_force_dims is None:
                 self.force_dim = int(force_encoder_cfg.get("force_dim", 12))
@@ -211,16 +261,19 @@ class FlowmatchingActionHead(nn.Module):
                 if self.force_dim == 0:
                     raise ValueError("force_encoder.selected_dims should not be empty")
             self.history_frames = int(force_encoder_cfg.get("history_frames", 10))
+            self.dit_condition_dim = int(
+                config.diffusion_model_cfg.get("cross_attention_dim", config.backbone_embedding_dim)
+            )
 
             if force_encoder_cfg.get("embodiment_aware", False):
                 self.force_encoder = CategorySpecificForceEncoder(
                     force_dim=self.force_dim,
                     history_frames=self.history_frames,
-                    hidden_dim=self.input_embedding_dim,
+                    hidden_dim=self.force_embedding_dim,
                     intermediate_dim=force_encoder_cfg.get("intermediate_dim", 512),
                     num_embodiments=config.max_num_embodiments,
                     num_layers=force_encoder_cfg.get("num_layers", 2),
-                    dropout=force_encoder_cfg.get("dropout", 0.1),
+                    dropout=force_encoder_dropout,
                     encoder_type=force_encoder_type,
                     gru_hidden_dim=force_encoder_cfg.get("gru_hidden_dim", 128),
                     gru_num_layers=force_encoder_cfg.get("gru_num_layers", 1),
@@ -230,10 +283,10 @@ class FlowmatchingActionHead(nn.Module):
                 self.force_encoder = ForceEncoder(
                     force_dim=self.force_dim,
                     history_frames=self.history_frames,
-                    hidden_dim=self.input_embedding_dim,
+                    hidden_dim=self.force_embedding_dim,
                     intermediate_dim=force_encoder_cfg.get("intermediate_dim", 512),
                     num_layers=force_encoder_cfg.get("num_layers", 2),
-                    dropout=force_encoder_cfg.get("dropout", 0.1),
+                    dropout=force_encoder_dropout,
                     encoder_type=force_encoder_type,
                     gru_hidden_dim=force_encoder_cfg.get("gru_hidden_dim", 128),
                     gru_num_layers=force_encoder_cfg.get("gru_num_layers", 1),
@@ -243,22 +296,22 @@ class FlowmatchingActionHead(nn.Module):
             self.force_fusion_mode = force_encoder_cfg.get("fusion_mode", "concat")
             if self.force_fusion_mode == "fuse":
                 self.state_force_fusion = nn.Sequential(
-                    nn.Linear(2 * self.hidden_size, self.hidden_size),
+                    nn.Linear(self.input_embedding_dim + self.force_embedding_dim, self.input_embedding_dim),
                     nn.ReLU(),
-                    nn.Linear(self.hidden_size, self.hidden_size),
+                    nn.Linear(self.input_embedding_dim, self.input_embedding_dim),
                 )
             elif self.force_fusion_mode == "vl_concat":
-                if self.input_embedding_dim == config.backbone_embedding_dim:
+                if self.force_embedding_dim == config.backbone_embedding_dim:
                     self.force_to_vl_proj = nn.Identity()
                 else:
                     self.force_to_vl_proj = nn.Linear(
-                        self.input_embedding_dim, config.backbone_embedding_dim
+                        self.force_embedding_dim, config.backbone_embedding_dim
                     )
-            if self.input_embedding_dim == config.backbone_embedding_dim:
+            if self.force_embedding_dim == self.dit_condition_dim:
                 self.force_to_condition_proj = nn.Identity()
             else:
                 self.force_to_condition_proj = nn.Linear(
-                    self.input_embedding_dim, config.backbone_embedding_dim
+                    self.force_embedding_dim, self.dit_condition_dim
                 )
         else:
             self.use_force_encoder = False
@@ -332,6 +385,24 @@ class FlowmatchingActionHead(nn.Module):
                     print(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             print("Warning: No action head trainable parameters found.")
+
+    def _reset_module_parameters(self, module: nn.Module):
+        for submodule in module.modules():
+            if isinstance(submodule, CategorySpecificLinear):
+                init.normal_(submodule.W, mean=0.0, std=0.02)
+                init.zeros_(submodule.b)
+                continue
+            if hasattr(submodule, "reset_parameters"):
+                submodule.reset_parameters()
+
+    def reinitialize_dit_state_action_encoders(self):
+        self._reset_module_parameters(self.model)
+        self._reset_module_parameters(self.state_encoder)
+        self._reset_module_parameters(self.action_encoder)
+        print(
+            "Action head DiT, state_encoder and action_encoder are reinitialized "
+            "for force_embedding_dim != backbone_embedding_dim."
+        )
 
     def set_frozen_modules_to_eval_mode(self):
         """
