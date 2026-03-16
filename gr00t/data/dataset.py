@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field, ValidationError
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from gr00t.experiment.expt_config import ExptConfig
 from gr00t.utils.video import get_all_frames, get_frames_by_timestamps
 
 from .embodiment_tags import EmbodimentTag
@@ -132,6 +133,26 @@ class LeRobotSingleDataset(Dataset):
         # first check if the path directory exists
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
+
+        self.expt_force_config = ExptConfig().force_config()
+        force_encoder_cfg = self.expt_force_config.get("force_input", {}).get("force_encoder", {})
+        selected_force_dims = force_encoder_cfg.get("selected_dims", None)
+        if selected_force_dims is None:
+            self.force_selected_dims = None
+        else:
+            if isinstance(selected_force_dims, int):
+                selected_force_dims = [selected_force_dims]
+            if not isinstance(selected_force_dims, (list, tuple)):
+                raise ValueError(
+                    f"force_encoder.selected_dims must be a list/tuple of integers, got {type(selected_force_dims)}"
+                )
+            self.force_selected_dims = [int(dim) for dim in selected_force_dims]
+            if len(self.force_selected_dims) == 0:
+                raise ValueError("force_encoder.selected_dims should not be empty when provided")
+            if any(dim < 0 for dim in self.force_selected_dims):
+                raise ValueError(
+                    f"force_encoder.selected_dims should be non-negative, got {self.force_selected_dims}"
+                )
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -538,7 +559,23 @@ class LeRobotSingleDataset(Dataset):
             dict: The data for the step.
         """
         trajectory_id, base_index = self.all_steps[index]
-        return self.transforms(self.get_step_data(trajectory_id, base_index))
+        out = self.transforms(self.get_step_data(trajectory_id, base_index))
+
+        # Build force signal [force_dim, history] from normalized/concatenated force trajectory.
+        if "force" in out:
+            force_signal = np.swapaxes(out["force"], -1, -2)
+            if self.force_selected_dims is not None:
+                max_force_dim = force_signal.shape[0]
+                invalid_dims = [dim for dim in self.force_selected_dims if dim >= max_force_dim]
+                if invalid_dims:
+                    raise IndexError(
+                        f"force_encoder.selected_dims contains out-of-range indices {invalid_dims}, "
+                        f"but force has {max_force_dim} dims"
+                    )
+                force_signal = force_signal[self.force_selected_dims, ...]
+            out["force_signal"] = force_signal
+
+        return out
 
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step in a trajectory. No transforms are applied.
@@ -834,6 +871,44 @@ class LeRobotSingleDataset(Dataset):
             task_indices.append(self.curr_traj_data[original_key][step_indices[i]].item())
         return self.tasks.loc[task_indices]["task"].tolist()
 
+    def get_force_sensor(
+        self,
+        trajectory_id: int,
+        key: str,
+        base_index: int,
+    ) -> np.ndarray:
+        """Get force sensor data for a trajectory by a base index.
+
+        Returns:
+            np.ndarray: Force data with shape (T, force_dim).
+        """
+        step_indices = self.delta_indices[key] + base_index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = self.trajectory_lengths[trajectory_index]
+
+        assert key.startswith("force."), f"{key} must start with force., got {key}"
+        subkey = key.replace("force.", "")
+
+        le_state_cfg = self.lerobot_modality_meta.state
+        le_key = le_state_cfg[subkey].original_key
+        if le_key is None:
+            le_key = "observation.state"
+
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])
+        assert data_array.ndim == 2, f"Expected 2D array, got {data_array.shape} array"
+
+        le_indices = np.arange(le_state_cfg[subkey].start, le_state_cfg[subkey].end)
+        data_array = data_array[:, le_indices]
+
+        return self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=step_indices,
+            max_length=max_length,
+            padding_strategy="zero",
+        )
+
     def get_data_by_modality(
         self,
         trajectory_id: int,
@@ -859,6 +934,8 @@ class LeRobotSingleDataset(Dataset):
             return self.get_state_or_action(trajectory_id, modality, key, base_index)
         elif modality == "language":
             return self.get_language(trajectory_id, key, base_index)
+        elif modality == "force":
+            return self.get_force_sensor(trajectory_id, key, base_index)
         else:
             raise ValueError(f"Invalid modality: {modality}")
 

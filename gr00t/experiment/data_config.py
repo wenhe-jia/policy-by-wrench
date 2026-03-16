@@ -20,6 +20,7 @@ from typing import Optional
 from gr00t.data.dataset import ModalityConfig
 from gr00t.data.transform.base import ComposedModalityTransform, ModalityTransform
 from gr00t.data.transform.concat import ConcatTransform
+from gr00t.data.transform.force import ForceToTensor, ForceTransform
 from gr00t.data.transform.state_action import (
     StateActionSinCosTransform,
     StateActionToTensor,
@@ -32,6 +33,7 @@ from gr00t.data.transform.video import (
     VideoToNumpy,
     VideoToTensor,
 )
+from gr00t.experiment.expt_config import ExptConfig
 from gr00t.model.transforms import GR00TTransform
 
 
@@ -726,6 +728,39 @@ class AgibotGenie1DataConfig(BaseDataConfig):
     language_keys = ["annotation.language.action_text"]
     observation_indices = [0]
     action_indices = list(range(16))
+    force_config = ExptConfig().force_config()
+    force_input = force_config.get("force_input", {}).get("enabled", False)
+    if force_input:
+        force_encoder_cfg = force_config.get("force_input", {}).get("force_encoder", {})
+        force_horizon = int(force_encoder_cfg.get("history_frames", 10))
+        force_dim = int(force_encoder_cfg.get("force_dim", 12))
+        selected_force_dims = force_encoder_cfg.get("selected_dims", None)
+        if selected_force_dims is not None:
+            if isinstance(selected_force_dims, int):
+                selected_force_dims = [selected_force_dims]
+            selected_force_dims = [int(dim) for dim in selected_force_dims]
+            if len(selected_force_dims) == 0:
+                raise ValueError("force_encoder.selected_dims should not be empty when provided")
+            if any(dim < 0 for dim in selected_force_dims):
+                raise ValueError(
+                    f"force_encoder.selected_dims should be non-negative, got {selected_force_dims}"
+                )
+            force_dim = max(force_dim, max(selected_force_dims) + 1)
+
+        force_keys = [
+            "force.left_force_sensor",
+            "force.right_force_sensor",
+        ]
+        force_indices = list(range(-force_horizon + 1, 1))
+
+    def modality_config(self) -> dict[str, ModalityConfig]:
+        modality_configs = super().modality_config()
+        if self.force_input:
+            modality_configs["force"] = ModalityConfig(
+                delta_indices=self.force_indices,
+                modality_keys=self.force_keys,
+            )
+        return modality_configs
 
     def transform(self):
         transforms = [
@@ -753,17 +788,34 @@ class AgibotGenie1DataConfig(BaseDataConfig):
                 apply_to=self.action_keys,
                 normalization_modes={key: "min_max" for key in self.action_keys},
             ),
-            # concat transforms
+        ]
+
+        if self.force_input:
+            transforms += [
+                ForceToTensor(apply_to=self.force_keys),
+                ForceTransform(
+                    apply_to=self.force_keys,
+                    normalization_modes={
+                        "force.left_force_sensor": "mean_std",
+                        "force.right_force_sensor": "mean_std",
+                    },
+                ),
+            ]
+
+        transforms += [
             ConcatTransform(
                 video_concat_order=self.video_keys,
                 state_concat_order=self.state_keys,
                 action_concat_order=self.action_keys,
+                force_concat_order=self.force_keys if self.force_input else None,
             ),
             GR00TTransform(
                 state_horizon=len(self.observation_indices),
                 action_horizon=len(self.action_indices),
                 max_state_dim=64,
                 max_action_dim=32,
+                force_horizon=self.force_horizon if self.force_input else None,
+                max_force_dim=self.force_dim if self.force_input else None,
             ),
         ]
 

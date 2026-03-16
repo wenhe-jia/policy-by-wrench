@@ -51,6 +51,12 @@ class ConcatTransform(InvertibleModalityTransform):
         "Format: ['action.position', 'action.velocity', ...].",
     )
 
+    force_concat_order: Optional[list[str]] = Field(
+        default=None,
+        description="Concatenation order for each force modality. "
+        "Format: ['force.left_force_sensor', 'force.right_force_sensor', ...].",
+    )
+
     action_dims: dict[str, int] = Field(
         default_factory=dict,
         description="The dimensions of the action keys.",
@@ -58,6 +64,10 @@ class ConcatTransform(InvertibleModalityTransform):
     state_dims: dict[str, int] = Field(
         default_factory=dict,
         description="The dimensions of the state keys.",
+    )
+    force_dims: dict[str, int] = Field(
+        default_factory=dict,
+        description="The dimensions of the force keys.",
     )
 
     def model_dump(self, *args, **kwargs):
@@ -67,6 +77,7 @@ class ConcatTransform(InvertibleModalityTransform):
                 "video_concat_order",
                 "state_concat_order",
                 "action_concat_order",
+                "force_concat_order",
             }
         else:
             include = kwargs.pop("include", None)
@@ -134,6 +145,21 @@ class ConcatTransform(InvertibleModalityTransform):
                 [data.pop(key) for key in self.state_concat_order], dim=-1
             )  # [T, D_state]
 
+        if "force" in grouped_keys:
+            force_keys = grouped_keys["force"]
+            assert self.force_concat_order is not None, f"{self.force_concat_order=}"
+            assert all(
+                item in force_keys for item in self.force_concat_order
+            ), f"keys in force_concat_order are misspecified, \n{force_keys=}, \n{self.force_concat_order=}"
+            for key in self.force_concat_order:
+                target_shapes = [self.force_dims[key]]
+                assert (
+                    data[key].shape[-1] in target_shapes
+                ), f"Force dim mismatch for {key=}, {data[key].shape[-1]=}, {target_shapes=}"
+            data["force"] = torch.cat(
+                [data.pop(key) for key in self.force_concat_order], dim=-1
+            )  # [T, D_force]
+
         if "action" in grouped_keys:
             action_keys = grouped_keys["action"]
             assert self.action_concat_order is not None, f"{self.action_concat_order=}"
@@ -177,6 +203,14 @@ class ConcatTransform(InvertibleModalityTransform):
                 end_dim = start_dim + self.state_dims[key]
                 data[key] = state_tensor[..., start_dim:end_dim]
                 start_dim = end_dim
+        if "force" in data:
+            assert self.force_concat_order is not None, f"{self.force_concat_order=}"
+            start_dim = 0
+            force_tensor = data.pop("force")
+            for key in self.force_concat_order:
+                end_dim = start_dim + self.force_dims[key]
+                data[key] = force_tensor[..., start_dim:end_dim]
+                start_dim = end_dim
         return data
 
     def __call__(self, data: dict) -> dict:
@@ -185,7 +219,10 @@ class ConcatTransform(InvertibleModalityTransform):
     def get_modality_metadata(self, key: str) -> StateActionMetadata:
         modality, subkey = key.split(".")
         assert self.dataset_metadata is not None, "Metadata not set"
-        modality_config = getattr(self.dataset_metadata.modalities, modality)
+        if modality == "force":
+            modality_config = self.dataset_metadata.modalities.state
+        else:
+            modality_config = getattr(self.dataset_metadata.modalities, modality)
         assert subkey in modality_config, f"{subkey=} not found in {modality_config=}"
         assert isinstance(
             modality_config[subkey], StateActionMetadata
@@ -213,3 +250,6 @@ class ConcatTransform(InvertibleModalityTransform):
         if self.state_concat_order is not None:
             for key in self.state_concat_order:
                 self.state_dims[key] = self.get_state_action_dims(key)
+        if self.force_concat_order is not None:
+            for key in self.force_concat_order:
+                self.force_dims[key] = self.get_state_action_dims(key)

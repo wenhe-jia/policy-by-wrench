@@ -13,30 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .base import (
-    ComposedModalityTransform,
-    InvertibleModalityTransform,
-    ModalityTransform,
-)
-from .concat import ConcatTransform
-from .force import ForceToTensor, ForceTransform
-from .state_action import (
-    StateActionDropout,
-    StateActionPerturbation,
-    StateActionSinCosTransform,
-    StateActionToTensor,
-    StateActionTransform,
-)
-from .video import (
-    VideoColorJitter,
-    VideoCrop,
-    VideoGrayscale,
-    VideoHorizontalFlip,
-    VideoRandomGrayscale,
-    VideoRandomPosterize,
-    VideoRandomRotation,
-    VideoResize,
-    VideoToNumpy,
-    VideoToTensor,
-    VideoTransform,
-)
+from .force_encoder import CategorySpecificForceEncoder, ForceEncoder

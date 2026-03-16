@@ -122,6 +122,8 @@ class GR00TTransform(InvertibleModalityTransform):
     max_action_dim: int
     state_horizon: int
     action_horizon: int
+    max_force_dim: Optional[int] = None
+    force_horizon: Optional[int] = None
 
     max_length: int = 512
     embodiment_tag: EmbodimentTag | None = None
@@ -298,6 +300,38 @@ class GR00TTransform(InvertibleModalityTransform):
 
         return actions, actions_mask, n_action_tokens
 
+    def _prepare_force(self, data: dict):
+        """
+        Gathers final force from data['force'], then pads to max_force_dim.
+        Return (force, force_mask, n_force_tokens).
+        """
+        max_force_dim = self.max_force_dim if self.max_force_dim is not None else self.max_state_dim
+        force_horizon = self.force_horizon if self.force_horizon is not None else self.state_horizon
+
+        if "force" not in data:
+            force = np.zeros((force_horizon, max_force_dim))
+            force_mask = np.zeros((force_horizon, max_force_dim), dtype=bool)
+            n_force_tokens = force_horizon
+            return force, force_mask, n_force_tokens
+
+        force = data["force"]
+        if self.force_horizon is not None:
+            assert force.shape[0] == self.force_horizon, f"{force.shape=}, {self.force_horizon=}"
+
+        n_force_dims = force.shape[-1]
+
+        if n_force_dims > max_force_dim:
+            force = force[:, :max_force_dim]
+            n_force_dims = max_force_dim
+        else:
+            force = np.pad(force, ((0, 0), (0, max_force_dim - n_force_dims)), "constant")
+
+        force_mask = np.zeros_like(force).astype(bool)
+        force_mask[:, :n_force_dims] = True
+
+        n_force_tokens = force.shape[0]
+        return force, force_mask, n_force_tokens
+
     def apply_single(self, data: dict) -> dict:
         transformed_data = {}
 
@@ -312,6 +346,10 @@ class GR00TTransform(InvertibleModalityTransform):
         state, state_mask, _ = self._prepare_state(data)
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
+        if "force" in data:
+            force, force_mask, _ = self._prepare_force(data)
+            transformed_data["force"] = force
+            transformed_data["force_mask"] = force_mask
 
         if self.training:
             # 3) Prepare actions

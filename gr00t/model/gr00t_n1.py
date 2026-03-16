@@ -85,6 +85,15 @@ class GR00T_N1_5(PreTrainedModel):
         self.action_horizon = config.action_horizon
         self.action_dim = config.action_dim
         self.compute_dtype = config.compute_dtype
+        self.skip_backbone_on_force_condition = bool(
+            getattr(config, "skip_backbone_on_force_condition", True)
+        )
+
+    def _uses_force_condition(self) -> bool:
+        return getattr(self.action_head, "condition_source", "vl") == "force"
+
+    def _should_skip_backbone(self) -> bool:
+        return self.skip_backbone_on_force_condition and self._uses_force_condition()
 
     def validate_inputs(self, inputs):
         # NOTE -- this should be handled internally by the model
@@ -125,17 +134,27 @@ class GR00T_N1_5(PreTrainedModel):
         if detected_error:
             raise ValueError(error_msg)
 
-    def validate_data(self, action_head_outputs, backbone_outputs, is_training):
-        fail_backbone = (
-            not isinstance(backbone_outputs, BatchFeature)
-            or BACKBONE_FEATURE_KEY not in backbone_outputs
-        )
+    def validate_data(
+        self, action_head_outputs, backbone_outputs, is_training, backbone_skipped: bool = False
+    ):
+        fail_backbone = False
+        if not backbone_skipped:
+            fail_backbone = (
+                not isinstance(backbone_outputs, BatchFeature)
+                or BACKBONE_FEATURE_KEY not in backbone_outputs
+            )
 
         if fail_backbone:
             error_msg = ERROR_MSG
             error_msg += f"\n{isinstance(backbone_outputs, BatchFeature)=}"
             error_msg += f"\n{BACKBONE_FEATURE_KEY in backbone_outputs=}"
-            error_msg += f"\n{backbone_outputs[BACKBONE_FEATURE_KEY].shape=}"
+            backbone_shape = (
+                backbone_outputs[BACKBONE_FEATURE_KEY].shape
+                if isinstance(backbone_outputs, BatchFeature)
+                and BACKBONE_FEATURE_KEY in backbone_outputs
+                else None
+            )
+            error_msg += f"\n{backbone_shape=}"
             raise ValueError(error_msg)
 
         fail_action_head = (not isinstance(action_head_outputs, BatchFeature)) or not (
@@ -153,7 +172,12 @@ class GR00T_N1_5(PreTrainedModel):
             error_msg = ERROR_MSG
             error_msg += f"\n{isinstance(action_head_outputs, BatchFeature)=}"
             error_msg += f"\n{LOSS_KEY in action_head_outputs=}"
-            error_msg += f"\n{action_head_outputs[ACTION_KEY].shape=}"
+            action_shape = (
+                action_head_outputs[ACTION_KEY].shape
+                if isinstance(action_head_outputs, BatchFeature) and ACTION_KEY in action_head_outputs
+                else None
+            )
+            error_msg += f"\n{action_shape=}"
             error_msg += f"\n{self.action_horizon=}"
             error_msg += f"\n{self.action_dim=}"
             raise ValueError(error_msg)
@@ -163,9 +187,18 @@ class GR00T_N1_5(PreTrainedModel):
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        backbone_outputs = self.backbone(backbone_inputs)
+        backbone_skipped = self._should_skip_backbone()
+        if backbone_skipped:
+            backbone_outputs = BatchFeature(data={})
+        else:
+            backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=True)
+        self.validate_data(
+            action_head_outputs,
+            backbone_outputs,
+            is_training=True,
+            backbone_skipped=backbone_skipped,
+        )
         return action_head_outputs
 
     def get_action(
@@ -173,15 +206,28 @@ class GR00T_N1_5(PreTrainedModel):
         inputs: dict,
     ) -> BatchFeature:
         backbone_inputs, action_inputs = self.prepare_input(inputs)
-        # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
-        backbone_outputs = self.backbone(backbone_inputs)
+        backbone_skipped = self._should_skip_backbone()
+        if backbone_skipped:
+            backbone_outputs = BatchFeature(data={})
+        else:
+            # Because the behavior of backbones remains the same for training and inference, we can use `forward` for backbones.
+            backbone_outputs = self.backbone(backbone_inputs)
         action_head_outputs = self.action_head.get_action(backbone_outputs, action_inputs)
-        self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
+        self.validate_data(
+            action_head_outputs,
+            backbone_outputs,
+            is_training=False,
+            backbone_skipped=backbone_skipped,
+        )
         return action_head_outputs
 
     def prepare_input(self, inputs) -> Tuple[BatchFeature, BatchFeature]:
         self.validate_inputs(inputs)
-        backbone_inputs = self.backbone.prepare_input(inputs)
+        backbone_skipped = self._should_skip_backbone()
+        if backbone_skipped:
+            backbone_inputs = BatchFeature(data={})
+        else:
+            backbone_inputs = self.backbone.prepare_input(inputs)
         action_inputs = self.action_head.prepare_input(inputs)
 
         def to_device_with_maybe_dtype(x):
@@ -202,12 +248,17 @@ class GR00T_N1_5(PreTrainedModel):
         tune_llm = kwargs.pop("tune_llm", False)
         tune_projector = kwargs.pop("tune_projector", True)
         tune_diffusion_model = kwargs.pop("tune_diffusion_model", True)
+        skip_backbone_on_force_condition = kwargs.pop("skip_backbone_on_force_condition", True)
 
         print(f"Loading pretrained dual brain from {pretrained_model_name_or_path}")
         print(f"Tune backbone vision tower: {tune_visual}")
         print(f"Tune backbone LLM: {tune_llm}")
         print(f"Tune action head projector: {tune_projector}")
         print(f"Tune action head DiT: {tune_diffusion_model}")
+        print(
+            "Skip backbone forward when force-conditioned DiT: "
+            f"{skip_backbone_on_force_condition}"
+        )
 
         # get the current model path being downloaded
         try:
@@ -227,6 +278,9 @@ class GR00T_N1_5(PreTrainedModel):
 
         pretrained_model.backbone.set_trainable_parameters(
             tune_visual=tune_visual, tune_llm=tune_llm
+        )
+        pretrained_model.skip_backbone_on_force_condition = bool(
+            skip_backbone_on_force_condition
         )
         pretrained_model.action_head.set_trainable_parameters(
             tune_projector=tune_projector, tune_diffusion_model=tune_diffusion_model

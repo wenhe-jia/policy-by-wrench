@@ -27,6 +27,7 @@ from gr00t.data.dataset import ModalityConfig
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.data.schema import DatasetMetadata
 from gr00t.data.transform.base import ComposedModalityTransform
+from gr00t.experiment.expt_config import ExptConfig
 from gr00t.model.gr00t_n1 import GR00T_N1_5
 
 COMPUTE_DTYPE = torch.bfloat16
@@ -97,6 +98,25 @@ class Gr00tPolicy(BasePolicy):
         self._modality_transform.eval()  # set this to eval mode
         self.model_path = Path(model_path)
         self.device = device
+        self.expt_force_config = ExptConfig().force_config()
+        force_encoder_cfg = self.expt_force_config.get("force_input", {}).get("force_encoder", {})
+        selected_force_dims = force_encoder_cfg.get("selected_dims", None)
+        if selected_force_dims is None:
+            self.force_selected_dims = None
+        else:
+            if isinstance(selected_force_dims, int):
+                selected_force_dims = [selected_force_dims]
+            if not isinstance(selected_force_dims, (list, tuple)):
+                raise ValueError(
+                    f"force_encoder.selected_dims must be a list/tuple of integers, got {type(selected_force_dims)}"
+                )
+            self.force_selected_dims = [int(dim) for dim in selected_force_dims]
+            if len(self.force_selected_dims) == 0:
+                raise ValueError("force_encoder.selected_dims should not be empty when provided")
+            if any(dim < 0 for dim in self.force_selected_dims):
+                raise ValueError(
+                    f"force_encoder.selected_dims should be non-negative, got {self.force_selected_dims}"
+                )
 
         # Convert string embodiment tag to EmbodimentTag enum if needed
         if isinstance(embodiment_tag, str):
@@ -130,6 +150,35 @@ class Gr00tPolicy(BasePolicy):
         """
         # Ensure correct dimensions before applying transforms
         return self._modality_transform(obs)
+
+    def _select_force_dims(self, force_signal: Any) -> Any:
+        """Select configured force dimensions on a [B, D, T] or [D, T] force tensor."""
+        if self.force_selected_dims is None:
+            return force_signal
+
+        if isinstance(force_signal, torch.Tensor):
+            force_dim_axis = force_signal.ndim - 2
+            max_force_dim = force_signal.shape[force_dim_axis]
+            invalid_dims = [dim for dim in self.force_selected_dims if dim >= max_force_dim]
+            if invalid_dims:
+                raise IndexError(
+                    f"force_encoder.selected_dims contains out-of-range indices {invalid_dims}, "
+                    f"but force_signal has {max_force_dim} dims"
+                )
+            index = torch.tensor(
+                self.force_selected_dims, dtype=torch.long, device=force_signal.device
+            )
+            return force_signal.index_select(dim=force_dim_axis, index=index)
+
+        force_signal_np = np.asarray(force_signal)
+        max_force_dim = force_signal_np.shape[-2]
+        invalid_dims = [dim for dim in self.force_selected_dims if dim >= max_force_dim]
+        if invalid_dims:
+            raise IndexError(
+                f"force_encoder.selected_dims contains out-of-range indices {invalid_dims}, "
+                f"but force_signal has {max_force_dim} dims"
+            )
+        return np.take(force_signal_np, self.force_selected_dims, axis=-2)
 
     def unapply_transforms(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -178,6 +227,29 @@ class Gr00tPolicy(BasePolicy):
                 obs_copy[k] = np.array(v)
 
         normalized_input = self.apply_transforms(obs_copy)
+        if "force_signal" in obs_copy:
+            force_signal = obs_copy["force_signal"]
+            if isinstance(force_signal, np.ndarray):
+                force_signal = torch.from_numpy(force_signal).float()
+            if hasattr(self, "metadata") and hasattr(self.metadata, "statistics"):
+                stats = self.metadata.statistics
+                force_keys = ["left_force_sensor", "right_force_sensor"]
+                force_norm_stats = []
+                for fk in force_keys:
+                    if hasattr(stats, "state") and fk in stats.state:
+                        fk_stats = stats.state[fk]
+                        mean = torch.tensor(fk_stats.mean, device=force_signal.device)
+                        std = torch.tensor(fk_stats.std, device=force_signal.device)
+                        force_norm_stats.append((mean, std))
+                if force_norm_stats:
+                    all_mean = torch.cat([m for m, _ in force_norm_stats])
+                    all_std = torch.cat([s for _, s in force_norm_stats]).clamp_min(1e-6)
+                    force_signal = (force_signal - all_mean.unsqueeze(-1)) / all_std.unsqueeze(-1)
+
+            force_signal = torch.transpose(force_signal, -1, -2)
+            force_signal = self._select_force_dims(force_signal)
+            normalized_input["force_signal"] = force_signal
+
         normalized_action = self._get_action_from_normalized_input(normalized_input)
         unnormalized_action = self._get_unnormalized_action(normalized_action)
 

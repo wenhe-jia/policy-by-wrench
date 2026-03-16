@@ -142,6 +142,13 @@ class LeRobotModalityMetadata(BaseModel):
                     f"Key: {key}, state key {subkey} not found in metadata, available state keys: {self.state.keys()}"
                 )
             return self.state[subkey]
+        elif modality == "force":
+            # Force keys are stored inside state metadata (e.g. left_force_sensor).
+            if subkey not in self.state:
+                raise ValueError(
+                    f"Key: {key}, force key {subkey} not found in state metadata, available state keys: {self.state.keys()}"
+                )
+            return self.state[subkey]
         elif modality == "action":
             if subkey not in self.action:
                 raise ValueError(

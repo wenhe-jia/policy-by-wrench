@@ -17,12 +17,15 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+import torch.nn.init as init
 from torch import nn
 from torch.distributions import Beta
 from transformers import PretrainedConfig
 from transformers.feature_extraction_utils import BatchFeature
 
+from gr00t.experiment.expt_config import ExptConfig
 from gr00t.model.action_head.action_encoder import SinusoidalPositionalEncoding, swish
+from gr00t.model.force.force_encoder import CategorySpecificForceEncoder, ForceEncoder
 
 from .cross_attention_dit import DiT, SelfAttentionTransformer
 
@@ -175,6 +178,8 @@ class FlowmatchingActionHead(nn.Module):
         self.action_dim = config.action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+        self.force_config = ExptConfig().force_config()
+        self.condition_source = "vl"
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -182,6 +187,82 @@ class FlowmatchingActionHead(nn.Module):
             hidden_dim=self.hidden_size,
             output_dim=self.input_embedding_dim,
         )
+        if self.force_config.get("force_input", {}).get("enabled", False):
+            self.use_force_encoder = True
+            force_encoder_cfg = self.force_config.get("force_input", {}).get("force_encoder", {})
+            self.condition_source = str(force_encoder_cfg.get("condition_source", "force")).lower()
+            if self.condition_source not in ("vl", "force"):
+                raise ValueError(
+                    f"Unsupported force_encoder.condition_source={self.condition_source!r}, "
+                    "expected 'vl' or 'force'"
+                )
+            force_encoder_type = str(force_encoder_cfg.get("encoder_type", "mlp")).lower()
+            selected_force_dims = force_encoder_cfg.get("selected_dims", None)
+            if selected_force_dims is None:
+                self.force_dim = int(force_encoder_cfg.get("force_dim", 12))
+            else:
+                if isinstance(selected_force_dims, int):
+                    selected_force_dims = [selected_force_dims]
+                if not isinstance(selected_force_dims, (list, tuple)):
+                    raise ValueError(
+                        "force_encoder.selected_dims must be a list/tuple of integer indices"
+                    )
+                self.force_dim = len(selected_force_dims)
+                if self.force_dim == 0:
+                    raise ValueError("force_encoder.selected_dims should not be empty")
+            self.history_frames = int(force_encoder_cfg.get("history_frames", 10))
+
+            if force_encoder_cfg.get("embodiment_aware", False):
+                self.force_encoder = CategorySpecificForceEncoder(
+                    force_dim=self.force_dim,
+                    history_frames=self.history_frames,
+                    hidden_dim=self.input_embedding_dim,
+                    intermediate_dim=force_encoder_cfg.get("intermediate_dim", 512),
+                    num_embodiments=config.max_num_embodiments,
+                    num_layers=force_encoder_cfg.get("num_layers", 2),
+                    dropout=force_encoder_cfg.get("dropout", 0.1),
+                    encoder_type=force_encoder_type,
+                    gru_hidden_dim=force_encoder_cfg.get("gru_hidden_dim", 128),
+                    gru_num_layers=force_encoder_cfg.get("gru_num_layers", 1),
+                    gru_bidirectional=force_encoder_cfg.get("gru_bidirectional", False),
+                )
+            else:
+                self.force_encoder = ForceEncoder(
+                    force_dim=self.force_dim,
+                    history_frames=self.history_frames,
+                    hidden_dim=self.input_embedding_dim,
+                    intermediate_dim=force_encoder_cfg.get("intermediate_dim", 512),
+                    num_layers=force_encoder_cfg.get("num_layers", 2),
+                    dropout=force_encoder_cfg.get("dropout", 0.1),
+                    encoder_type=force_encoder_type,
+                    gru_hidden_dim=force_encoder_cfg.get("gru_hidden_dim", 128),
+                    gru_num_layers=force_encoder_cfg.get("gru_num_layers", 1),
+                    gru_bidirectional=force_encoder_cfg.get("gru_bidirectional", False),
+                )
+
+            self.force_fusion_mode = force_encoder_cfg.get("fusion_mode", "concat")
+            if self.force_fusion_mode == "fuse":
+                self.state_force_fusion = nn.Sequential(
+                    nn.Linear(2 * self.hidden_size, self.hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_size, self.hidden_size),
+                )
+            elif self.force_fusion_mode == "vl_concat":
+                if self.input_embedding_dim == config.backbone_embedding_dim:
+                    self.force_to_vl_proj = nn.Identity()
+                else:
+                    self.force_to_vl_proj = nn.Linear(
+                        self.input_embedding_dim, config.backbone_embedding_dim
+                    )
+            if self.input_embedding_dim == config.backbone_embedding_dim:
+                self.force_to_condition_proj = nn.Identity()
+            else:
+                self.force_to_condition_proj = nn.Linear(
+                    self.input_embedding_dim, config.backbone_embedding_dim
+                )
+        else:
+            self.use_force_encoder = False
+
         self.action_encoder = MultiEmbodimentActionEncoder(
             action_dim=config.action_dim,
             hidden_size=self.input_embedding_dim,
@@ -219,6 +300,21 @@ class FlowmatchingActionHead(nn.Module):
         self.tune_diffusion_model = tune_diffusion_model
         for p in self.parameters():
             p.requires_grad = True
+        if self.force_config.get("force_input", {}).get("enabled", {}):
+            self.force_encoder.initialize_weights()
+            if (
+                self.force_fusion_mode == "vl_concat"
+                and hasattr(self, "force_to_vl_proj")
+                and isinstance(self.force_to_vl_proj, nn.Linear)
+            ):
+                init.xavier_uniform_(self.force_to_vl_proj.weight)
+                init.zeros_(self.force_to_vl_proj.bias)
+            if (
+                hasattr(self, "force_to_condition_proj")
+                and isinstance(self.force_to_condition_proj, nn.Linear)
+            ):
+                init.xavier_uniform_(self.force_to_condition_proj.weight)
+                init.zeros_(self.force_to_condition_proj.bias)
         if not tune_projector:
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
@@ -267,11 +363,41 @@ class FlowmatchingActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def _encode_force_features(
+        self, action_input: BatchFeature, embodiment_id: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not self.use_force_encoder or not hasattr(action_input, "force_signal"):
+            return None
+
+        force_signal = action_input.force_signal
+        expected = (self.force_dim, self.history_frames)
+        assert (
+            force_signal.shape[1:] == expected
+        ), f"Expected [B, {expected[0]}, {expected[1]}], got {force_signal.shape}"
+
+        if hasattr(self.force_encoder, "encoders"):
+            return self.force_encoder(force_signal, embodiment_id)
+        return self.force_encoder(force_signal)
+
+    def _build_force_condition(
+        self, action_input: BatchFeature, embodiment_id: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        force_features = self._encode_force_features(action_input, embodiment_id)
+        if force_features is None:
+            raise ValueError(
+                "force_signal is required when force_encoder.condition_source is set to 'force'"
+            )
+        cond_embs = self.force_to_condition_proj(force_features)
+        cond_mask = torch.ones(
+            (cond_embs.size(0), cond_embs.size(1)),
+            dtype=torch.long,
+            device=cond_embs.device,
+        )
+        return cond_embs, cond_mask
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
-
-        backbone_output = self.process_backbone_output(backbone_output)
 
         if self.config.expand_batch is not None:
             for k, v in backbone_output.items():
@@ -292,15 +418,37 @@ class FlowmatchingActionHead(nn.Module):
                 expanded = v.repeat(*factors)
                 action_input[k] = expanded
 
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
-        device = vl_embs.device
-
         # Get embodiment ID.
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        force_features = self._encode_force_features(action_input, embodiment_id)
+        if (
+            self.condition_source == "vl"
+            and force_features is not None
+            and self.force_fusion_mode == "fuse"
+        ):
+            combined = torch.cat([state_features, force_features], dim=-1)
+            state_features = self.state_force_fusion(combined)
+            if state_features.ndim == 2:
+                state_features = state_features.unsqueeze(1)
+
+        if self.condition_source == "force":
+            cond_embs, cond_attn_mask = self._build_force_condition(action_input, embodiment_id)
+        else:
+            backbone_output = self.process_backbone_output(backbone_output)
+            cond_embs = backbone_output.backbone_features
+            cond_attn_mask = backbone_output.backbone_attention_mask
+            if force_features is not None and self.force_fusion_mode == "vl_concat":
+                force_vl_features = self.force_to_vl_proj(force_features).to(dtype=cond_embs.dtype)
+                cond_embs = torch.cat([cond_embs, force_vl_features], dim=1)
+                force_attn_mask = torch.ones(
+                    (force_vl_features.size(0), force_vl_features.size(1)),
+                    dtype=cond_attn_mask.dtype,
+                    device=cond_attn_mask.device,
+                )
+                cond_attn_mask = torch.cat([cond_attn_mask, force_attn_mask], dim=1)
 
         # Embed noised action trajectory.
         actions = action_input.action
@@ -316,21 +464,20 @@ class FlowmatchingActionHead(nn.Module):
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
 
         # Maybe add position embedding.
+        device = action_features.device
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
             pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
             action_features = action_features + pos_embs
 
-        # Join vision, language, state and action embedding along sequence dimension.
-        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+        # Joint hidden input = state_token + future_token + action_token.
+        future_tokens = self.future_tokens.weight.unsqueeze(0).expand(state_features.shape[0], -1, -1)
         sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
-
-        vl_attn_mask = backbone_output.backbone_attention_mask
 
         model_output = self.model(
             hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs,
-            encoder_attention_mask=vl_attn_mask,
+            encoder_hidden_states=cond_embs,
+            encoder_attention_mask=cond_attn_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
         )
@@ -348,22 +495,43 @@ class FlowmatchingActionHead(nn.Module):
 
     @torch.no_grad()
     def get_action(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
-
-        backbone_output = self.process_backbone_output(backbone_output)
-
-        # Get vision and language embeddings.
-        vl_embs = backbone_output.backbone_features
         embodiment_id = action_input.embodiment_id
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        force_features = self._encode_force_features(action_input, embodiment_id)
+        if (
+            self.condition_source == "vl"
+            and force_features is not None
+            and self.force_fusion_mode == "fuse"
+        ):
+            combined = torch.cat([state_features, force_features], dim=-1)
+            state_features = self.state_force_fusion(combined)
+            if state_features.ndim == 2:
+                state_features = state_features.unsqueeze(1)
+
+        if self.condition_source == "force":
+            cond_embs, cond_attn_mask = self._build_force_condition(action_input, embodiment_id)
+        else:
+            backbone_output = self.process_backbone_output(backbone_output)
+            cond_embs = backbone_output.backbone_features
+            cond_attn_mask = backbone_output.backbone_attention_mask
+            if force_features is not None and self.force_fusion_mode == "vl_concat":
+                force_vl_features = self.force_to_vl_proj(force_features).to(dtype=cond_embs.dtype)
+                cond_embs = torch.cat([cond_embs, force_vl_features], dim=1)
+                force_attn_mask = torch.ones(
+                    (force_vl_features.size(0), force_vl_features.size(1)),
+                    dtype=cond_attn_mask.dtype,
+                    device=cond_attn_mask.device,
+                )
+                cond_attn_mask = torch.cat([cond_attn_mask, force_attn_mask], dim=1)
 
         # Set initial actions as the sampled noise.
-        batch_size = vl_embs.shape[0]
-        device = vl_embs.device
+        batch_size = state_features.shape[0]
+        device = state_features.device
         actions = torch.randn(
             size=(batch_size, self.config.action_horizon, self.config.action_dim),
-            dtype=vl_embs.dtype,
+            dtype=state_features.dtype,
             device=device,
         )
 
@@ -386,14 +554,15 @@ class FlowmatchingActionHead(nn.Module):
                 pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
                 action_features = action_features + pos_embs
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(vl_embs.shape[0], -1, -1)
+            # Joint hidden input = state_token + future_token + action_token.
+            future_tokens = self.future_tokens.weight.unsqueeze(0).expand(state_features.shape[0], -1, -1)
             sa_embs = torch.cat((state_features, future_tokens, action_features), dim=1)
 
             # Run model forward.
             model_output = self.model(
                 hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
+                encoder_hidden_states=cond_embs,
+                encoder_attention_mask=cond_attn_mask,
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output, embodiment_id)
